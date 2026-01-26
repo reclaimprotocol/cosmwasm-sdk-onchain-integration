@@ -94,4 +94,4 @@ const func = () => __awaiter(void 0, void 0, void 0, function* () {
     }, "auto");
 });
 func();
-//# sourceMappingURL=index.js.map
+//# sourceMappingURL=index.js.map;

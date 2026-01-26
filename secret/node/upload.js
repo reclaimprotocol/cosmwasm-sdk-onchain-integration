@@ -1,3 +1,5 @@
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 import { SecretNetworkClient, Wallet } from "secretjs";
 import * as fs from "fs";
 import dotenv from "dotenv";
