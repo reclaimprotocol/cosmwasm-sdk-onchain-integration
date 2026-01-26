@@ -39,7 +39,7 @@ make vanilla
 Build for Secret Network:
 
 ```bash
-make secret
+make secr
 ```
 
 Both commands produce:

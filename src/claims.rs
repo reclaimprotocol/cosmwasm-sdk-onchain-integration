@@ -4,9 +4,7 @@ use crate::ContractError;
 mod identity_digest;
 #[cfg(feature = "vanilla")]
 use cosmwasm_std::DepsMut;
-use k256::{
-    ecdsa::{RecoveryId, Signature, VerifyingKey}, // type aliases
-};
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -14,12 +12,24 @@ use sha3::{Digest, Keccak256};
 #[cfg(feature = "secret")]
 use secret_std::DepsMut;
 
+/// Prepends "0x" to a hex string.
+///
+/// # Arguments
+/// * `content` - The hex string to prepend to
+///
+/// # Returns
+/// The string with "0x" prepended
 pub fn append_0x(content: &str) -> String {
-    let mut initializer = String::from("0x");
-    initializer.push_str(content);
-    initializer
+    format!("0x{}", content)
 }
 
+/// Computes the Ethereum signed message hash (EIP-191).
+///
+/// # Arguments
+/// * `message` - The message to hash
+///
+/// # Returns
+/// The keccak256 hash of the Ethereum signed message
 pub fn keccak256(message: &str) -> Vec<u8> {
     let message: &[u8] = message.as_ref();
 
@@ -28,8 +38,7 @@ pub fn keccak256(message: &str) -> Vec<u8> {
     let mut hasher = Keccak256::new();
     hasher.update(&eth_message);
 
-    let hash = hasher.finalize().to_vec();
-    hash
+    hasher.finalize().to_vec()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -82,56 +91,124 @@ pub struct SignedClaim {
 }
 
 impl SignedClaim {
+    /// Recovers the Ethereum addresses of all signers from their signatures.
+    ///
+    /// # Arguments
+    /// * `_deps` - Dependencies (unused, kept for API compatibility)
+    ///
+    /// # Returns
+    /// * `Ok(Vec<String>)` - List of recovered Ethereum addresses with "0x" prefix
+    /// * `Err(ContractError)` - If any signature is invalid or recovery fails
     pub fn recover_signers_of_signed_claim(
         self,
         _deps: DepsMut,
     ) -> Result<Vec<String>, ContractError> {
+        let serialised_claim = self.claim.serialise();
+        let message_hash = keccak256(serialised_claim.as_str());
+
+        let mut expected = Vec::with_capacity(self.signatures.len());
+
+        for complete_signature in &self.signatures {
+            let recovered_address = Self::recover_single_signer(complete_signature, &message_hash)?;
+            expected.push(recovered_address);
+        }
+
+        Ok(expected)
+    }
+
+    /// Recovers a single signer's Ethereum address from their signature.
+    ///
+    /// The signature is expected to be a hex string with "0x" prefix,
+    /// containing r (32 bytes) + s (32 bytes) + v (1 byte) = 65 bytes total.
+    ///
+    /// # Arguments
+    /// * `complete_signature` - The hex-encoded signature with "0x" prefix
+    /// * `message_hash` - The keccak256 hash of the signed message
+    ///
+    /// # Returns
+    /// * `Ok(String)` - The recovered Ethereum address with "0x" prefix
+    /// * `Err(ContractError)` - If the signature is invalid or recovery fails
+    fn recover_single_signer(
+        complete_signature: &str,
+        message_hash: &[u8],
+    ) -> Result<String, ContractError> {
         use crate::claims::identity_digest::Identity256;
         use digest::Update;
-        // Create empty array
-        let mut expected = vec![];
-        // Hash the signature
-        let serialised_claim = self.claim.serialise();
 
-        let bm = keccak256(serialised_claim.as_str());
-        let message_hash = bm.to_vec();
+        // Validate and strip "0x" prefix
+        let sig_without_prefix = complete_signature
+            .strip_prefix("0x")
+            .ok_or_else(|| ContractError::InvalidSignatureFormat {
+                reason: "Missing 0x prefix".to_string(),
+            })?;
 
-        // For each signature in the claim
-        for mut complete_signature in self.signatures {
-            complete_signature.remove(0);
-            complete_signature.remove(0);
-            let rec_param = complete_signature
-                .get((complete_signature.len() as usize - 2)..(complete_signature.len() as usize))
-                .unwrap();
-            let mut mut_sig_str = complete_signature.clone();
-            mut_sig_str.pop();
-            mut_sig_str.pop();
-
-            let rec_dec = hex::decode(rec_param).unwrap();
-            let rec_norm = rec_dec.first().unwrap() - 27;
-            let r_s = hex::decode(mut_sig_str).unwrap();
-
-            let id = match rec_norm {
-                0 => RecoveryId::new(false, false),
-                1 => RecoveryId::new(true, false),
-                _ => return Err(ContractError::SignatureErr {}),
-            };
-
-            let signature = Signature::from_bytes(r_s.as_slice().into()).unwrap();
-            let message_digest = Identity256::new().chain(&message_hash);
-
-            // Recover the public key
-            let verkey = VerifyingKey::recover_from_digest(message_digest, &signature, id).unwrap();
-            let key: Vec<u8> = verkey.to_encoded_point(false).as_bytes().into();
-            let hasher = Keccak256::new_with_prefix(&key[1..]);
-
-            let hash = hasher.finalize().to_vec();
-
-            let address_bytes = hash.get(12..).unwrap();
-            let public_key = append_0x(&hex::encode(address_bytes));
-            expected.push(public_key);
+        // Validate minimum length: 64 bytes for r+s = 128 hex chars + 2 for v
+        if sig_without_prefix.len() < 130 {
+            return Err(ContractError::InvalidSignatureFormat {
+                reason: format!(
+                    "Signature too short: expected at least 130 hex chars, got {}",
+                    sig_without_prefix.len()
+                ),
+            });
         }
-        Ok(expected)
+
+        // Extract recovery parameter (last byte) and r+s components
+        let sig_len = sig_without_prefix.len();
+        let rec_param_hex = &sig_without_prefix[sig_len - 2..];
+        let r_s_hex = &sig_without_prefix[..sig_len - 2];
+
+        // Decode recovery parameter
+        let rec_dec = hex::decode(rec_param_hex).map_err(|e| {
+            ContractError::HexDecodeError(format!("Recovery param decode failed: {}", e))
+        })?;
+
+        let rec_byte = *rec_dec.first().ok_or_else(|| ContractError::InvalidSignatureFormat {
+            reason: "Empty recovery parameter".to_string(),
+        })?;
+
+        // Normalize recovery parameter (Ethereum uses 27/28, we need 0/1)
+        if rec_byte < 27 || rec_byte > 28 {
+            return Err(ContractError::InvalidRecoveryParam { value: rec_byte });
+        }
+        let rec_norm = rec_byte - 27;
+
+        // Decode r and s components
+        let r_s = hex::decode(r_s_hex).map_err(|e| {
+            ContractError::HexDecodeError(format!("Signature r,s decode failed: {}", e))
+        })?;
+
+        // Create recovery ID
+        let id = match rec_norm {
+            0 => RecoveryId::new(false, false),
+            1 => RecoveryId::new(true, false),
+            _ => return Err(ContractError::SignatureErr {}),
+        };
+
+        // Parse signature bytes
+        let signature = Signature::from_bytes(r_s.as_slice().into())
+            .map_err(|_| ContractError::SignatureConversionError {})?;
+
+        let message_digest = Identity256::new().chain(message_hash);
+
+        // Recover the public key
+        let verkey = VerifyingKey::recover_from_digest(message_digest, &signature, id)
+            .map_err(|_| ContractError::KeyRecoveryError {})?;
+
+        // Convert public key to Ethereum address
+        let key: Vec<u8> = verkey.to_encoded_point(false).as_bytes().into();
+        let hasher = Keccak256::new_with_prefix(&key[1..]);
+        let hash = hasher.finalize().to_vec();
+
+        // Validate hash length and extract address (last 20 bytes)
+        if hash.len() < 32 {
+            return Err(ContractError::InvalidHashLength {
+                expected: 32,
+                actual: hash.len(),
+            });
+        }
+
+        let address_bytes = &hash[12..];
+        Ok(append_0x(&hex::encode(address_bytes)))
     }
 }
 
